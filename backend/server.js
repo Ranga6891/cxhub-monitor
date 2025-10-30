@@ -30,6 +30,7 @@ db.exec(`
     port INTEGER,
     health_url TEXT,
     check_interval INTEGER DEFAULT 60,
+    response_threshold INTEGER DEFAULT 4000,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (server_id) REFERENCES servers(id) ON DELETE CASCADE
   );
@@ -120,38 +121,39 @@ app.delete('/api/servers/:id', (req, res) => {
 
 // Create application
 app.post('/api/applications', (req, res) => {
-  const { server_id, name, port, health_url, check_interval } = req.body;
-  
+  const { server_id, name, port, health_url, check_interval, response_threshold } = req.body;
+
   if (!server_id || !name) {
     return res.status(400).json({ error: 'Server ID and name are required' });
   }
 
   const result = db.prepare(`
-    INSERT INTO applications (server_id, name, port, health_url, check_interval)
-    VALUES (?, ?, ?, ?, ?)
-  `).run(server_id, name, port || null, health_url || null, check_interval || 60);
-  
-  res.json({ 
-    id: result.lastInsertRowid, 
-    server_id, 
-    name, 
-    port, 
-    health_url, 
-    check_interval 
+    INSERT INTO applications (server_id, name, port, health_url, check_interval, response_threshold)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `).run(server_id, name, port || null, health_url || null, check_interval || 60, response_threshold || 4000);
+
+  res.json({
+    id: result.lastInsertRowid,
+    server_id,
+    name,
+    port,
+    health_url,
+    check_interval,
+    response_threshold
   });
 });
 
 // Update application
 app.put('/api/applications/:id', (req, res) => {
-  const { name, port, health_url, check_interval } = req.body;
-  
+  const { name, port, health_url, check_interval, response_threshold } = req.body;
+
   db.prepare(`
-    UPDATE applications 
-    SET name = ?, port = ?, health_url = ?, check_interval = ?
+    UPDATE applications
+    SET name = ?, port = ?, health_url = ?, check_interval = ?, response_threshold = ?
     WHERE id = ?
-  `).run(name, port || null, health_url || null, check_interval || 60, req.params.id);
-  
-  res.json({ id: req.params.id, name, port, health_url, check_interval });
+  `).run(name, port || null, health_url || null, check_interval || 60, response_threshold || 4000, req.params.id);
+
+  res.json({ id: req.params.id, name, port, health_url, check_interval, response_threshold });
 });
 
 // Delete application
@@ -305,29 +307,64 @@ async function performChecks(app) {
   return results;
 }
 
-// Run checks for all applications
+// Run checks for all applications in parallel
 async function runAllChecks() {
   console.log('[MONITOR] Running scheduled checks...');
-  
+  const startTime = Date.now();
+
   const applications = db.prepare(`
-    SELECT a.*, s.host 
+    SELECT a.*, s.host
     FROM applications a
     JOIN servers s ON a.server_id = s.id
   `).all();
 
-  for (const app of applications) {
-    try {
-      await performChecks(app);
-    } catch (error) {
+  const checkPromises = applications.map(app =>
+    performChecks(app).catch(error => {
       console.error(`[MONITOR] Error checking app ${app.name}:`, error.message);
-    }
-  }
-  
-  console.log(`[MONITOR] Completed checks for ${applications.length} applications`);
+      return null;
+    })
+  );
+
+  await Promise.allSettled(checkPromises);
+
+  const duration = Date.now() - startTime;
+  console.log(`[MONITOR] Completed checks for ${applications.length} applications in ${duration}ms`);
 }
 
-// Schedule checks every minute
-cron.schedule('* * * * *', runAllChecks);
+// Dynamic scheduler that respects individual app intervals
+let lastCheckTime = {};
+
+setInterval(() => {
+  const applications = db.prepare(`
+    SELECT a.*, s.host
+    FROM applications a
+    JOIN servers s ON a.server_id = s.id
+  `).all();
+
+  const now = Date.now();
+  const checksToRun = [];
+
+  for (const app of applications) {
+    const lastCheck = lastCheckTime[app.id] || 0;
+    const interval = (app.check_interval || 60) * 1000;
+
+    if (now - lastCheck >= interval) {
+      checksToRun.push(app);
+      lastCheckTime[app.id] = now;
+    }
+  }
+
+  if (checksToRun.length > 0) {
+    console.log(`[MONITOR] Running ${checksToRun.length} scheduled checks...`);
+    const checkPromises = checksToRun.map(app =>
+      performChecks(app).catch(error => {
+        console.error(`[MONITOR] Error checking app ${app.name}:`, error.message);
+        return null;
+      })
+    );
+    Promise.allSettled(checkPromises);
+  }
+}, 5000);
 
 // Cleanup old checks (keep last 1000 per application)
 cron.schedule('0 * * * *', () => {
